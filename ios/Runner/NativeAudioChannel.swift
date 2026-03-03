@@ -58,6 +58,8 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     private var isRecording       = false
     private var playbackReady     = false
     private var recordEngineReady = false
+    // Desired speaker routing — persisted so it survives activateSession() calls
+    private var speakerEnabled    = true
 
     // Playback format — must match piper-lessac TTS WAV output
     private let playbackSampleRate: Double = 22050
@@ -180,8 +182,11 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
         try s.setCategory(.playAndRecord, mode: .default,
                           options: [.allowBluetooth, .defaultToSpeaker])
         try s.setActive(true)
-
-        print("[NativeAudio] session active: sr=\(s.sampleRate) route=\(s.currentRoute.outputs.map{$0.portType.rawValue})")
+        // Re-apply speaker override every time — setCategory resets it.
+        // This is the exact step that was missing and caused 50% volume:
+        // .defaultToSpeaker is only a hint; the explicit override forces the route.
+        try s.overrideOutputAudioPort(speakerEnabled ? .speaker : .none)
+        print("[NativeAudio] session active: sr=\(s.sampleRate) speakerEnabled=\(speakerEnabled) route=\(s.currentRoute.outputs.map{$0.portType.rawValue})")
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -400,19 +405,15 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
 
     // ─────────────────────────────────────────────────────────────────────
     //  setSpeaker
-    //  Uses mode: .default to keep full output volume.
-    //  .defaultToSpeaker is already set at category level; for earpiece we
-    //  use overrideOutputAudioPort(.none) to cancel the speaker override.
+    //  Stores the desired route then re-activates the session so the
+    //  overrideOutputAudioPort is applied fresh (setCategory resets it).
     // ─────────────────────────────────────────────────────────────────────
     private func setSpeaker(enabled: Bool, result: FlutterResult) {
         print("[NativeAudio] setSpeaker() enabled=\(enabled)")
+        speakerEnabled = enabled
         do {
-            let s = AVAudioSession.sharedInstance()
-            try s.setCategory(.playAndRecord, mode: .default,
-                              options: [.allowBluetooth, .defaultToSpeaker])
-            try s.setActive(true)
-            try s.overrideOutputAudioPort(enabled ? .speaker : .none)
-            print("[NativeAudio] setSpeaker() route=\(s.currentRoute.outputs.map{$0.portType.rawValue})")
+            try activateSession()   // activateSession now calls overrideOutputAudioPort
+            print("[NativeAudio] setSpeaker() route=\(AVAudioSession.sharedInstance().currentRoute.outputs.map{$0.portType.rawValue})")
             result(true)
         } catch {
             print("[NativeAudio] setSpeaker() FAILED: \(error)")

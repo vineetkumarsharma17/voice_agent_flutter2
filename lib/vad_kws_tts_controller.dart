@@ -91,6 +91,14 @@ class VadKwsTtsController extends ChangeNotifier {
   String? _ttsError;
   String _ttsStatusDetail = '';
 
+  // ── Speaker Toggle ───────────────────────────────────────────────────────
+  bool _isSpeakerOn = false; // Start with earpiece (speaker off)
+
+  // ── Constructor ──────────────────────────────────────────────────────────
+  VadKwsTtsController() {
+    // No automatic speaker override - user controls it manually
+  }
+
   // ── Getters ───────────────────────────────────────────────────────────────
 
   KwsState get kwsState => _kwsState;
@@ -106,6 +114,8 @@ class VadKwsTtsController extends ChangeNotifier {
   bool get kwsRunning => _kwsState == KwsState.listening;
   bool get ttsRunning =>
       _ttsState == TtsState.synthesising || _ttsState == TtsState.playing;
+
+  bool get isSpeakerOn => _isSpeakerOn;
 
   // ─────────────────────────────────────────────────────────────────────────
   //  Initialisation — call once when the screen opens
@@ -359,6 +369,31 @@ class VadKwsTtsController extends ChangeNotifier {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  //  Speaker Toggle API
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Toggle between speaker and earpiece output (like WhatsApp calls)
+  Future<void> toggleSpeaker() async {
+    _isSpeakerOn = !_isSpeakerOn;
+    notifyListeners();
+
+    try {
+      if (_isSpeakerOn) {
+        debugPrint('[Audio] 🔊 Switching to SPEAKER');
+        await AudioSessionManager.overrideToSpeaker();
+      } else {
+        debugPrint('[Audio] 📱 Switching to EARPIECE');
+        await AudioSessionManager.setToEarpiece();
+      }
+    } catch (e) {
+      debugPrint('[Audio] ❌ Failed to toggle speaker: $e');
+      // Revert state on error
+      _isSpeakerOn = !_isSpeakerOn;
+      notifyListeners();
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   //  TTS API
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -373,13 +408,8 @@ class VadKwsTtsController extends ChangeNotifier {
       if (_ttsEngine == null) return; // init failed, error already set
     }
 
-    // Reconfigure audio session to ensure playback goes to speaker
-    // and doesn't interrupt the mic recording.
-    try {
-      await AudioSessionManager.configure();
-    } catch (e) {
-      debugPrint('[TTS] Warning: Failed to configure audio session: $e');
-    }
+    // Audio session is configured during startKws
+    // Speaker/earpiece is controlled by the toggle button
 
     final thisToken = ++_ttsToken;
     _ttsState = TtsState.synthesising;
@@ -421,6 +451,9 @@ class VadKwsTtsController extends ChangeNotifier {
 
           // Now play without requesting focus
           unawaited(_player.play());
+
+          // User controls speaker/earpiece via toggle button
+
           _ttsState = TtsState.playing;
           _ttsStatusDetail = 'Playing chunk 1…';
           notifyListeners();

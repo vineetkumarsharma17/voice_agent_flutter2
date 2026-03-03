@@ -317,6 +317,38 @@ class _VadKwsTtsScreenState extends State<VadKwsTtsScreen> {
                       ),
                     ],
                   ),
+                  const SizedBox(height: 10),
+                  // Speaker toggle button (like WhatsApp)
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: _ctrl.toggleSpeaker,
+                      icon: Icon(
+                        _ctrl.isSpeakerOn
+                            ? Icons.volume_up
+                            : Icons.phone_in_talk,
+                        color: _ctrl.isSpeakerOn ? cs.primary : cs.secondary,
+                      ),
+                      label: Text(
+                        _ctrl.isSpeakerOn
+                            ? 'Speaker ON'
+                            : 'Earpiece (Tap for Speaker)',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: _ctrl.isSpeakerOn ? cs.primary : cs.secondary,
+                        ),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        side: BorderSide(
+                          color: _ctrl.isSpeakerOn ? cs.primary : cs.secondary,
+                          width: 2,
+                        ),
+                        backgroundColor: _ctrl.isSpeakerOn
+                            ? cs.primary.withOpacity(0.1)
+                            : cs.secondary.withOpacity(0.05),
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),

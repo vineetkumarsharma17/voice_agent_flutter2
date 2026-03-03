@@ -137,12 +137,25 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  setupEngine  — attach + connect playerNode; does NOT start the engine
+    //  setupEngine  — attach + connect playerNode; does NOT start the engine.
+    //
+    //  IMPORTANT: AVAudioEngine ALWAYS includes the inputNode in the graph.
+    //  Calling engine.reset() forces a full graph teardown — after that,
+    //  engine.start() / engine.prepare() run InitializeActiveNodesInInputChain
+    //  which tries to bring up the mic hardware. If the session is .playback
+    //  only (no mic access), this crashes with -10868.
+    //
+    //  Therefore we NEVER call engine.reset(). We keep the session as
+    //  .playAndRecord at all times so the input node can always initialize,
+    //  and we only add/remove the tap to control whether mic data flows.
     // ─────────────────────────────────────────────────────────────────────
     private func setupEngine() throws {
         print("[NativeAudio] setupEngine()")
         engine.attach(playerNode)
 
+        // Connect playerNode → mainMixerNode with the explicit Float32 format
+        // that we convert all WAV buffers into before scheduling.
+        // This must match the format passed to AVAudioConverter in playWav().
         guard let playFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                           sampleRate: playbackSampleRate,
                                           channels: playbackChannels,
@@ -151,7 +164,7 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
                           userInfo: [NSLocalizedDescriptionKey: "Cannot create playback format"])
         }
         engine.connect(playerNode, to: engine.mainMixerNode, format: playFmt)
-        print("[NativeAudio] setupEngine() playFmt=\(playFmt.sampleRate)Hz \(playFmt.channelCount)ch")
+        print("[NativeAudio] setupEngine() playFmt=\(playFmt.sampleRate)Hz \(playFmt.channelCount)ch Float32")
         engine.prepare()
         engineReady = true
     }
@@ -170,14 +183,16 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
         print("[NativeAudio] startRecording() isRecording=\(isRecording) engineRunning=\(engine.isRunning)")
         guard !isRecording else { result(true); return }
         do {
+            // Session must be .playAndRecord — the engine's inputNode is always
+            // part of the graph and CoreAudio will try to initialize it on
+            // engine.start(). If the session doesn't allow input, you get -10868.
             try activateSession()
             if !engineReady { try setupEngine() }
 
             // Remove any stale tap before installing a new one
             engine.inputNode.removeTap(onBus: 0)
 
-            // Stop the engine if it was running (e.g. TTS was active).
-            // AVAudioEngine requires a restart after topology changes.
+            // Stop the engine — required before any topology change (new tap).
             if engine.isRunning {
                 engine.stop()
                 print("[NativeAudio] startRecording() engine stopped to apply tap")
@@ -216,38 +231,38 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
 
     // ─────────────────────────────────────────────────────────────────────
     //  stopRecording
-    //  Removes the tap, switches session to playback-only so iOS dismisses
-    //  the red microphone indicator, then restarts the engine for TTS.
+    //  Removes the mic tap and stops the engine.
+    //
+    //  Session stays .playAndRecord — we MUST NOT switch to .playback here.
+    //  AVAudioEngine's inputNode is permanently wired into the graph; if
+    //  engine.start() is ever called with a .playback-only session, CoreAudio
+    //  runs InitializeActiveNodesInInputChain → -10868 crash.
+    //  Keeping .playAndRecord is safe: the red mic indicator disappears as
+    //  soon as the tap is removed (no tap = no active capture).
+    //  The engine is left stopped; playWav() starts it lazily.
     // ─────────────────────────────────────────────────────────────────────
     private func stopRecording(result: FlutterResult) {
         print("[NativeAudio] stopRecording() isRecording=\(isRecording)")
         guard isRecording else { result(true); return }
 
-        // 1. Remove the mic tap
+        // 1. Remove the mic tap — this is what iOS uses to decide whether
+        //    the mic indicator (red dot) should show. No tap = no indicator.
         engine.inputNode.removeTap(onBus: 0)
         isRecording = false
         print("[NativeAudio] stopRecording() tap removed")
 
-        // 2. Stop the engine before changing session category
+        // 2. Stop the engine (playWav will restart it when needed)
         engine.stop()
+        print("[NativeAudio] stopRecording() engine stopped")
 
-        // 3. Switch to playback-only — this releases the microphone and
-        //    dismisses the iOS red dot / microphone indicator.
+        // 3. Keep session as .playAndRecord so the next engine.start()
+        //    (from playWav or startRecording) can initialize the input node
+        //    without hitting -10868.
+        //    activateSession() sets .playAndRecord — call it to refresh.
         do {
-            let s = AVAudioSession.sharedInstance()
-            try s.setCategory(.playback, mode: .default, options: [.allowBluetooth])
-            try s.setActive(true)
-            print("[NativeAudio] stopRecording() session -> playback (mic released)")
+            try activateSession()
         } catch {
-            print("[NativeAudio] stopRecording() session switch failed: \(error)")
-        }
-
-        // 4. Restart engine so TTS can play immediately
-        do {
-            try engine.start()
-            print("[NativeAudio] stopRecording() engine restarted for TTS")
-        } catch {
-            print("[NativeAudio] stopRecording() engine restart failed: \(error)")
+            print("[NativeAudio] stopRecording() session refresh failed: \(error)")
         }
 
         result(true)
@@ -255,7 +270,13 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
 
     // ─────────────────────────────────────────────────────────────────────
     //  playWav
-    //  Parses WAV header in memory (no disk I/O), schedules the buffer.
+    //  Parses WAV header in memory (no disk I/O), converts to the playerNode
+    //  connection format (Float32 @ playbackSampleRate), then schedules.
+    //
+    //  AVAudioPlayerNode.scheduleBuffer requires the buffer format to EXACTLY
+    //  match the node's connection format.  The WAV from Flutter is Int16 PCM
+    //  (wav_utils.dart always writes 16-bit), so we must convert to Float32
+    //  before scheduling — otherwise the bytes are reinterpreted → noise.
     // ─────────────────────────────────────────────────────────────────────
     private func playWav(data: Data, result: FlutterResult) {
         print("[NativeAudio] playWav() \(data.count)B engineReady=\(engineReady) running=\(engine.isRunning)")
@@ -264,26 +285,48 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
                 try activateSession()
                 try setupEngine()
             }
-            // If engine stopped (e.g. after stopRecording switched to .playback),
-            // ensure session is active (stays .playback if mic not needed) and restart.
+            // Engine stopped (e.g. after stopRecording). Session is already
+            // .playAndRecord (stopRecording keeps it that way), so we can
+            // start directly — the input node will initialize cleanly.
             if !engine.isRunning {
-                let s = AVAudioSession.sharedInstance()
-                if s.category != .playAndRecord && s.category != .playback {
-                    try s.setCategory(.playback, mode: .default, options: [.allowBluetooth])
-                }
-                try s.setActive(true)
+                try activateSession()
                 try engine.start()
                 print("[NativeAudio] playWav() engine started")
             }
 
-            guard let buffer = try wavDataToPCMBuffer(data) else {
+            guard let rawBuffer = try wavDataToPCMBuffer(data) else {
                 print("[NativeAudio] playWav() decode failed for \(data.count)B")
                 result(FlutterError(code: "WAV_ERROR",
                                     message: "Cannot decode WAV (\(data.count) bytes)",
                                     details: nil)); return
             }
+
+            // Convert to Float32 @ playbackSampleRate — must match the format
+            // the playerNode was connected with in setupEngine().
+            // AVAudioPlayerNode does NOT auto-convert; wrong format = noise.
+            guard let playFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                              sampleRate: playbackSampleRate,
+                                              channels: playbackChannels,
+                                              interleaved: false) else {
+                result(FlutterError(code: "PLAY_ERROR",
+                                    message: "Cannot create playback format", details: nil)); return
+            }
+
+            let buffer: AVAudioPCMBuffer
+            if rawBuffer.format == playFmt {
+                buffer = rawBuffer  // already the right format
+            } else {
+                guard let converted = convertBuffer(rawBuffer, to: playFmt) else {
+                    result(FlutterError(code: "PLAY_ERROR",
+                                        message: "Format conversion failed \(rawBuffer.format.sampleRate)Hz \(rawBuffer.format.commonFormat.rawValue) → Float32@\(playbackSampleRate)",
+                                        details: nil)); return
+                }
+                print("[NativeAudio] playWav() converted \(rawBuffer.format.sampleRate)Hz \(rawBuffer.format.commonFormat.rawValue == 3 ? "Int16" : "other") → Float32@\(playbackSampleRate)")
+                buffer = converted
+            }
+
             let bFmt = buffer.format
-            print("[NativeAudio] playWav() buffer: \(buffer.frameLength)fr \(bFmt.sampleRate)Hz \(bFmt.channelCount)ch")
+            print("[NativeAudio] playWav() scheduling: \(buffer.frameLength)fr \(bFmt.sampleRate)Hz \(bFmt.channelCount)ch Float32")
 
             playerNode.scheduleBuffer(buffer) {
                 print("[NativeAudio] playWav() chunk done \(buffer.frameLength)fr")
@@ -443,11 +486,23 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
         // ── Parse fmt chunk ────────────────────────────────────────────────
         // Bytes 0-3: "RIFF", 4-7: file size, 8-11: "WAVE"
         // Bytes 12-15: "fmt ", 16-19: chunk size (16 for PCM)
-        let numChannels: UInt32 = data.withUnsafeBytes { $0.load(fromByteOffset: 22, as: UInt16.self) }.bigEndianToHost() == 0
-            ? UInt32(data.withUnsafeBytes { $0.load(fromByteOffset: 22, as: UInt16.self) })
-            : UInt32(data.withUnsafeBytes { $0.load(fromByteOffset: 22, as: UInt16.self) })
-        let sampleRateRaw: UInt32 = data.withUnsafeBytes { $0.load(fromByteOffset: 24, as: UInt32.self) }
-        let bitsPerSample: UInt16 = data.withUnsafeBytes { $0.load(fromByteOffset: 34, as: UInt16.self) }
+        let numChannels: UInt32 = data.withUnsafeBytes { buffer in
+            let byte0 = buffer[22]
+            let byte1 = buffer[23]
+            return UInt32((UInt16(byte1) << 8) | UInt16(byte0))
+        }
+        let sampleRateRaw: UInt32 = data.withUnsafeBytes { buffer in
+            let byte0 = UInt32(buffer[24])
+            let byte1 = UInt32(buffer[25])
+            let byte2 = UInt32(buffer[26])
+            let byte3 = UInt32(buffer[27])
+            return byte0 | (byte1 << 8) | (byte2 << 16) | (byte3 << 24)
+        }
+        let bitsPerSample: UInt16 = data.withUnsafeBytes { buffer in
+            let byte0 = UInt16(buffer[34])
+            let byte1 = UInt16(buffer[35])
+            return byte0 | (byte1 << 8)
+        }
 
         // All WAV fields are little-endian; Swift on ARM is also LE — no swap needed.
         let channels   = UInt32(numChannels)
@@ -460,8 +515,12 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
         var dataSize   = 0
         while dataOffset + 8 <= data.count {
             let tag = data.subdata(in: dataOffset..<(dataOffset + 4))
-            let chunkSize: UInt32 = data.withUnsafeBytes {
-                $0.load(fromByteOffset: dataOffset + 4, as: UInt32.self)
+            let chunkSize: UInt32 = data.withUnsafeBytes { buffer in
+                let byte0 = UInt32(buffer[dataOffset + 4])
+                let byte1 = UInt32(buffer[dataOffset + 5])
+                let byte2 = UInt32(buffer[dataOffset + 6])
+                let byte3 = UInt32(buffer[dataOffset + 7])
+                return byte0 | (byte1 << 8) | (byte2 << 16) | (byte3 << 24)
             }
             if tag == Data("data".utf8) {
                 dataOffset += 8

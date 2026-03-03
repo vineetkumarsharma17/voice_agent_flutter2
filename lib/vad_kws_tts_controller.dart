@@ -145,21 +145,25 @@ class VadKwsTtsController extends ChangeNotifier {
   Future<void> initEngines() async {
     // Run both initialisations concurrently; failures are surfaced via the
     // respective error fields so the UI can show them independently.
-    await Future.wait([_initKwsEngine(), _initTtsEngine()]);
+    // TODO: KWS init commented out to isolate white-screen crash
+    // await Future.wait([_initKwsEngine(), _initTtsEngine()]);
+    await _initTtsEngine();
   }
 
+  // ignore: unused_element
   Future<void> _initKwsEngine() async {
-    if (_kwsEngine != null) return;
-    _kwsState = KwsState.loading;
-    notifyListeners();
-    try {
-      await _ensureKwsEngine();
-      _kwsState = KwsState.idle;
-    } catch (e) {
-      _kwsError = 'KWS init failed: $e';
-      _kwsState = KwsState.idle;
-    }
-    notifyListeners();
+    // TODO: commented out for crash isolation
+    // if (_kwsEngine != null) return;
+    // _kwsState = KwsState.loading;
+    // notifyListeners();
+    // try {
+    //   await _ensureKwsEngine();
+    //   _kwsState = KwsState.idle;
+    // } catch (e) {
+    //   _kwsError = 'KWS init failed: $e';
+    //   _kwsState = KwsState.idle;
+    // }
+    // notifyListeners();
   }
 
   Future<void> _initTtsEngine() async {

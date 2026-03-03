@@ -1,15 +1,52 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
-import 'package:just_audio/just_audio.dart';
-import 'package:record/record.dart';
+import 'package:flutter/services.dart';
 
-import 'voice_agent/audio_session_manager.dart';
 import 'voice_agent/audio_utils.dart';
 import 'voice_agent/kws_engine.dart';
 import 'voice_agent/model_registry.dart';
 import 'voice_agent/tts_engine.dart';
 import 'voice_agent/wav_utils.dart';
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Native audio bridge (iOS only — uses NativeAudioChannel.swift)
+//  All AVAudioSession ownership lives on the Swift side; Flutter never touches
+//  record or just_audio for this controller.
+// ─────────────────────────────────────────────────────────────────────────────
+class _NativeAudio {
+  static const _method = MethodChannel('com.voiceagent/native_audio');
+  static const _event = EventChannel('com.voiceagent/native_audio_stream');
+
+  static Future<bool> configure() =>
+      _method.invokeMethod<bool>('configure').then((v) => v ?? false);
+  static Future<bool> startRecording() =>
+      _method.invokeMethod<bool>('startRecording').then((v) => v ?? false);
+  static Future<bool> stopRecording() =>
+      _method.invokeMethod<bool>('stopRecording').then((v) => v ?? false);
+  static Future<bool> stopPlayback() =>
+      _method.invokeMethod<bool>('stopPlayback').then((v) => v ?? false);
+  static Future<bool> setSpeaker({required bool enabled}) =>
+      _method.invokeMethod<bool>(
+          'setSpeaker', {'enabled': enabled}).then((v) => v ?? false);
+  static Future<bool> hasPermission() =>
+      _method.invokeMethod<bool>('hasPermission').then((v) => v ?? false);
+  static Future<bool> requestPermission() =>
+      _method.invokeMethod<bool>('requestPermission').then((v) => v ?? false);
+
+  static Future<bool> playWav(Uint8List wavBytes) =>
+      _method.invokeMethod<bool>('playWav', {
+        'wavBytes': Uint8List.fromList(wavBytes),
+      }).then((v) => v ?? false);
+
+  /// Broadcast stream of raw PCM-16 [Uint8List] buffers from the mic.
+  static Stream<Uint8List> get audioStream =>
+      _event.receiveBroadcastStream().map((event) {
+        if (event is Uint8List) return event;
+        // EventChannel delivers typed data as Uint8List on iOS
+        return Uint8List.fromList((event as List).cast<int>());
+      });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  State enums
@@ -48,11 +85,12 @@ class KwsDetectionEvent {
 /// Controls simultaneous KWS (keyword spotting via mic) and TTS (audio
 /// playback).  Both run independently — KWS always listens through the mic
 /// while TTS plays through the speaker.
+///
+/// On iOS all audio I/O goes through [_NativeAudio] (NativeAudioChannel.swift)
+/// so the AVAudioSession is owned entirely by native code and no Flutter plugin
+/// can override it.
 class VadKwsTtsController extends ChangeNotifier {
-  static const int _sampleRate = 16000;
-
   // ── KWS ──────────────────────────────────────────────────────────────────
-  final AudioRecorder _recorder = AudioRecorder();
   StreamSubscription<Uint8List>? _audioSub;
   KwsEngine? _kwsEngine;
   Timer? _audioHealthCheck; // Monitor if audio stream is alive
@@ -67,23 +105,6 @@ class VadKwsTtsController extends ChangeNotifier {
   final List<String> keywords = const ['▁ST O P', '▁HE LL O', '▁HO L D ▁ON'];
 
   // ── TTS ──────────────────────────────────────────────────────────────────
-  late final AudioPlayer _player = AudioPlayer(
-    // Let the player run but don't let it interrupt other audio
-    handleInterruptions: false,
-    androidApplyAudioAttributes:
-        true, // Changed: we need to apply custom attributes
-    handleAudioSessionActivation: false,
-    audioLoadConfiguration: const AudioLoadConfiguration(
-      androidLoadControl: AndroidLoadControl(
-        // Prevent buffering from causing issues
-        // minBufferDuration must be >= bufferForPlaybackMs and bufferForPlaybackAfterRebufferMs
-        minBufferDuration: Duration(milliseconds: 2500),
-        maxBufferDuration: Duration(seconds: 5),
-        bufferForPlaybackDuration: Duration(milliseconds: 500),
-        bufferForPlaybackAfterRebufferDuration: Duration(milliseconds: 1000),
-      ),
-    ),
-  );
   TtsEngine? _ttsEngine;
 
   TtsState _ttsState = TtsState.idle;
@@ -95,9 +116,7 @@ class VadKwsTtsController extends ChangeNotifier {
   bool _isSpeakerOn = false; // Start with earpiece (speaker off)
 
   // ── Constructor ──────────────────────────────────────────────────────────
-  VadKwsTtsController() {
-    // No automatic speaker override - user controls it manually
-  }
+  VadKwsTtsController(); // No automatic speaker override - user controls it manually
 
   // ── Getters ───────────────────────────────────────────────────────────────
 
@@ -171,7 +190,8 @@ class VadKwsTtsController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await AudioSessionManager.configure();
+      // Configure native AVAudioSession (Swift side owns it entirely)
+      await _NativeAudio.configure();
 
       // If engine somehow not loaded yet, load it now.
       if (_kwsEngine == null) {
@@ -180,7 +200,9 @@ class VadKwsTtsController extends ChangeNotifier {
         await _ensureKwsEngine();
       }
 
-      final ok = await _recorder.hasPermission();
+      // Check / request mic permission through native channel
+      final ok = await _NativeAudio.hasPermission().then(
+          (v) => v ? Future.value(true) : _NativeAudio.requestPermission());
       if (!ok) {
         _kwsError = 'Microphone permission denied.';
         _kwsState = KwsState.idle;
@@ -188,24 +210,8 @@ class VadKwsTtsController extends ChangeNotifier {
         return;
       }
 
-      final stream = await _recorder.startStream(
-        const RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          numChannels: 1,
-          sampleRate: _sampleRate,
-          autoGain: false,
-          echoCancel:
-              true, // IMPORTANT: Enable echo cancellation to prevent feedback from speaker
-          noiseSuppress: false,
-          androidConfig: AndroidRecordConfig(
-            // CRITICAL: Use VOICE_RECOGNITION source - it doesn't pause on audio focus loss
-            // and is designed to work while other audio plays
-            audioSource: AndroidAudioSource.voiceRecognition,
-          ),
-        ),
-      );
-
-      _audioSub = stream.listen(
+      // Subscribe to the native PCM-16 stream BEFORE starting the hardware tap
+      _audioSub = _NativeAudio.audioStream.listen(
         _onAudioData,
         onError: (Object err) {
           debugPrint('[KWS] ❌ Audio stream error: $err');
@@ -222,6 +228,8 @@ class VadKwsTtsController extends ChangeNotifier {
         },
         cancelOnError: false,
       );
+
+      await _NativeAudio.startRecording();
 
       _kwsState = KwsState.listening;
       notifyListeners();
@@ -241,7 +249,7 @@ class VadKwsTtsController extends ChangeNotifier {
     _lastAudioReceived = null;
     await _audioSub?.cancel();
     _audioSub = null;
-    await _recorder.stop();
+    await _NativeAudio.stopRecording();
     _kwsEngine?.reset();
     _kwsState = KwsState.idle;
     _lastDetectedWord = '';
@@ -258,8 +266,7 @@ class VadKwsTtsController extends ChangeNotifier {
       if (lastReceived != null &&
           now.difference(lastReceived).inSeconds > 2 &&
           _kwsState == KwsState.listening) {
-        debugPrint(
-            '[KWS] ⚠️ No audio received for 2s - audio focus likely lost. Attempting restart...');
+        debugPrint('[KWS] ⚠️ No audio received for 2s — attempting restart...');
         _restartKwsRecording();
       }
     });
@@ -272,28 +279,13 @@ class VadKwsTtsController extends ChangeNotifier {
       // Don't change state - keep it as "listening"
       await _audioSub?.cancel();
       _audioSub = null;
-      await _recorder.stop();
+      await _NativeAudio.stopRecording();
 
       // Small delay
       await Future.delayed(const Duration(milliseconds: 100));
 
-      // Restart stream
-      final stream = await _recorder.startStream(
-        const RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          numChannels: 1,
-          sampleRate: _sampleRate,
-          autoGain: false,
-          echoCancel:
-              true, // IMPORTANT: Enable echo cancellation to prevent feedback from speaker
-          noiseSuppress: false,
-          androidConfig: AndroidRecordConfig(
-            audioSource: AndroidAudioSource.voiceRecognition,
-          ),
-        ),
-      );
-
-      _audioSub = stream.listen(
+      // Re-subscribe then restart the hardware tap
+      _audioSub = _NativeAudio.audioStream.listen(
         _onAudioData,
         onError: (Object err) {
           debugPrint('[KWS] ❌ Audio stream error: $err');
@@ -311,6 +303,7 @@ class VadKwsTtsController extends ChangeNotifier {
         cancelOnError: false,
       );
 
+      await _NativeAudio.startRecording();
       _lastAudioReceived = DateTime.now();
       debugPrint('[KWS] ✅ Recording restarted successfully');
     } catch (e) {
@@ -380,10 +373,10 @@ class VadKwsTtsController extends ChangeNotifier {
     try {
       if (_isSpeakerOn) {
         debugPrint('[Audio] 🔊 Switching to SPEAKER');
-        await AudioSessionManager.overrideToSpeaker();
+        await _NativeAudio.setSpeaker(enabled: true);
       } else {
         debugPrint('[Audio] 📱 Switching to EARPIECE');
-        await AudioSessionManager.setToEarpiece();
+        await _NativeAudio.setSpeaker(enabled: false);
       }
     } catch (e) {
       debugPrint('[Audio] ❌ Failed to toggle speaker: $e');
@@ -408,8 +401,9 @@ class VadKwsTtsController extends ChangeNotifier {
       if (_ttsEngine == null) return; // init failed, error already set
     }
 
-    // Audio session is configured during startKws
-    // Speaker/earpiece is controlled by the toggle button
+    // Always configure the native audio session before playing.
+    // This is idempotent — safe to call even if startKws already called it.
+    await _NativeAudio.configure();
 
     final thisToken = ++_ttsToken;
     _ttsState = TtsState.synthesising;
@@ -423,37 +417,24 @@ class VadKwsTtsController extends ChangeNotifier {
         language: profile,
       );
 
-      bool firstChunk = true;
-      final playlist = ConcatenatingAudioSource(children: []);
-      await _player.stop();
+      // Stop any leftover playback from a previous TTS run
+      await _NativeAudio.stopPlayback();
 
       if (_ttsToken != thisToken) return;
 
+      bool firstChunk = true;
       await for (final chunk in stream) {
         if (_ttsToken != thisToken) {
           _ttsEngine!.stopStream();
           break;
         }
+
+        // Convert PCM samples → WAV bytes and send to native player
         final wavBytes = wavBytesFromSamples(chunk.samples, chunk.sampleRate);
-        await playlist.add(BytesAudioSource(wavBytes));
+        await _NativeAudio.playWav(wavBytes);
 
         if (firstChunk) {
           firstChunk = false;
-
-          // Set audio attributes to NOT request audio focus
-          // This prevents the recorder from being paused
-          await _player.setAudioSource(
-            playlist,
-            initialIndex: 0,
-            initialPosition: Duration.zero,
-            preload: false, // Don't preload to avoid early focus request
-          );
-
-          // Now play without requesting focus
-          unawaited(_player.play());
-
-          // User controls speaker/earpiece via toggle button
-
           _ttsState = TtsState.playing;
           _ttsStatusDetail = 'Playing chunk 1…';
           notifyListeners();
@@ -461,6 +442,13 @@ class VadKwsTtsController extends ChangeNotifier {
           _ttsStatusDetail = 'Playing… chunk ${chunk.chunkIndex + 1}';
           notifyListeners();
         }
+      }
+
+      // All chunks queued — mark as idle once the last chunk finishes
+      if (_ttsToken == thisToken) {
+        _ttsState = TtsState.idle;
+        _ttsStatusDetail = '';
+        notifyListeners();
       }
     } catch (e) {
       if (_ttsToken == thisToken) {
@@ -475,7 +463,7 @@ class VadKwsTtsController extends ChangeNotifier {
   Future<void> stopTts() async {
     _ttsToken++;
     _ttsEngine?.stopStream();
-    await _player.stop();
+    await _NativeAudio.stopPlayback();
     _ttsState = TtsState.stopped;
     _ttsStatusDetail = 'Stopped.';
     notifyListeners();
@@ -495,9 +483,9 @@ class VadKwsTtsController extends ChangeNotifier {
   void dispose() {
     _audioHealthCheck?.cancel();
     _audioSub?.cancel();
-    _recorder.dispose();
+    _NativeAudio.stopRecording();
     _kwsEngine?.dispose();
-    _player.dispose();
+    _NativeAudio.stopPlayback();
     _ttsEngine?.dispose();
     super.dispose();
   }

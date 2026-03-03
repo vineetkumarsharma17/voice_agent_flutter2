@@ -13,7 +13,8 @@ class AudioSessionManager {
         androidAudioAttributes: const AndroidAudioAttributes(
           contentType: AndroidAudioContentType.speech,
           flags: AndroidAudioFlags.none,
-          usage: AndroidAudioUsage.media,
+          usage: AndroidAudioUsage
+              .assistant, // Use assistant mode: speaker output + echo cancellation
         ),
         androidAudioFocusGainType:
             AndroidAudioFocusGainType.gainTransientMayDuck,

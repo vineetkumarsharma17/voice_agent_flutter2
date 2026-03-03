@@ -184,7 +184,8 @@ class VadKwsTtsController extends ChangeNotifier {
           numChannels: 1,
           sampleRate: _sampleRate,
           autoGain: false,
-          echoCancel: false,
+          echoCancel:
+              true, // IMPORTANT: Enable echo cancellation to prevent feedback from speaker
           noiseSuppress: false,
           androidConfig: AndroidRecordConfig(
             // CRITICAL: Use VOICE_RECOGNITION source - it doesn't pause on audio focus loss
@@ -273,7 +274,8 @@ class VadKwsTtsController extends ChangeNotifier {
           numChannels: 1,
           sampleRate: _sampleRate,
           autoGain: false,
-          echoCancel: false,
+          echoCancel:
+              true, // IMPORTANT: Enable echo cancellation to prevent feedback from speaker
           noiseSuppress: false,
           androidConfig: AndroidRecordConfig(
             audioSource: AndroidAudioSource.voiceRecognition,

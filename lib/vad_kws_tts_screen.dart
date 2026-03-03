@@ -12,33 +12,11 @@ From voice assistants that answer our questions to recommendation systems that s
 AI is everywhere. One of the most exciting areas of AI research is natural language processing, 
 which enables machines to understand and generate human language.
 
-Speech recognition systems have improved dramatically in recent years. 
-On-device models can now transcribe spoken words with high accuracy even without an internet connection. 
-This is important for privacy, latency, and reliability in real-world applications. 
-Keyword spotting is a lightweight form of speech recognition that listens continuously for specific trigger words. 
-Systems like Amazon Alexa and Google Assistant use keyword spotting to detect their wake words before activating full speech recognition.
-
 Text-to-speech synthesis has also advanced significantly. 
 Neural vocoders and end-to-end TTS systems produce natural-sounding speech that is difficult to distinguish from a real human voice. 
 The Piper TTS system, which powers this application, uses VITS — a variational inference model with adversarial learning. 
 It runs entirely on device, producing high-quality audio at real-time speed even on mobile hardware.
-
-Combining keyword detection with simultaneous audio playback is a challenging engineering problem. 
-The microphone must remain active while audio plays through the speaker. 
-Echo cancellation algorithms attempt to subtract the speaker output from the microphone input, 
-but they are not perfect. Background noise, room acoustics, and hardware quality all affect performance.
-
-This test screen lets you evaluate how well keyword spotting works while the device is speaking. 
-Try saying the words stop, hello, or hold on while the audio is playing. 
-The system should detect your voice even through the playback audio. 
-Watch the detection history panel below to see which keywords were detected and whether TTS was active at that moment.
-
 Real-world voice agent systems must handle these situations gracefully. 
-A user might interrupt the agent mid-sentence, ask a follow-up question, or say a wake word to restart the conversation. 
-Robust barge-in detection is essential for a natural conversational experience. 
-By running this test, you can measure the false positive rate, the false negative rate, 
-and the overall reliability of the keyword detection system under realistic conditions.
-
 Thank you for testing this application. The results you observe here will help improve the voice agent pipeline.
 ''';
 
@@ -99,10 +77,10 @@ class _VadKwsTtsScreenState extends State<VadKwsTtsScreen> {
   }
 
   String _kwsStateLabel() => switch (_ctrl.kwsState) {
-    KwsState.idle => 'Idle',
-    KwsState.loading => 'Loading model…',
-    KwsState.listening => 'Listening…',
-  };
+        KwsState.idle => 'Idle',
+        KwsState.loading => 'Loading model…',
+        KwsState.listening => 'Listening…',
+      };
 
   String _ttsStateLabel() => _ctrl.ttsStatusDetail.isNotEmpty
       ? _ctrl.ttsStatusDetail
@@ -197,8 +175,8 @@ class _VadKwsTtsScreenState extends State<VadKwsTtsScreen> {
                           _ctrl.lastDetectedWord.isNotEmpty
                               ? _ctrl.lastDetectedWord.toUpperCase()
                               : (_ctrl.kwsRunning
-                                    ? 'Waiting for keyword…'
-                                    : 'Not listening'),
+                                  ? 'Waiting for keyword…'
+                                  : 'Not listening'),
                           style: theme.textTheme.titleLarge?.copyWith(
                             fontWeight: FontWeight.bold,
                             color: _ctrl.lastDetectedWord.isNotEmpty
@@ -427,9 +405,8 @@ class _VadKwsTtsScreenState extends State<VadKwsTtsScreen> {
                                   : '${event.timeLabel}  •  🔇 detected without TTS',
                               style: TextStyle(
                                 fontSize: 11,
-                                color: event.duringTts
-                                    ? cs.tertiary
-                                    : cs.outline,
+                                color:
+                                    event.duringTts ? cs.tertiary : cs.outline,
                               ),
                             ),
                           );
@@ -647,11 +624,11 @@ class _SmallSpinner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-    width: 16,
-    height: 16,
-    child: CircularProgressIndicator(
-      strokeWidth: 2,
-      color: Theme.of(context).colorScheme.onPrimary,
-    ),
-  );
+        width: 16,
+        height: 16,
+        child: CircularProgressIndicator(
+          strokeWidth: 2,
+          color: Theme.of(context).colorScheme.onPrimary,
+        ),
+      );
 }

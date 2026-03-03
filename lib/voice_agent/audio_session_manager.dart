@@ -6,16 +6,18 @@ class AudioSessionManager {
     await session.configure(
       AudioSessionConfiguration(
         avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
-        avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.allowBluetooth |
-            AVAudioSessionCategoryOptions.defaultToSpeaker,
+        avAudioSessionCategoryOptions:
+            AVAudioSessionCategoryOptions.allowBluetooth |
+                AVAudioSessionCategoryOptions.defaultToSpeaker,
         avAudioSessionMode: AVAudioSessionMode.voiceChat,
         androidAudioAttributes: const AndroidAudioAttributes(
           contentType: AndroidAudioContentType.speech,
           flags: AndroidAudioFlags.none,
-          usage: AndroidAudioUsage.voiceCommunication,
+          usage: AndroidAudioUsage.media,
         ),
-        androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
-        androidWillPauseWhenDucked: true,
+        androidAudioFocusGainType:
+            AndroidAudioFocusGainType.gainTransientMayDuck,
+        androidWillPauseWhenDucked: false,
       ),
     );
     await session.setActive(true);

@@ -31,7 +31,7 @@ class KwsDetectionEvent {
   final bool duringTts;
 
   KwsDetectionEvent({required this.keyword, required this.duringTts})
-    : timestamp = DateTime.now();
+      : timestamp = DateTime.now();
 
   String get timeLabel {
     final h = timestamp.hour.toString().padLeft(2, '0');
@@ -55,17 +55,35 @@ class VadKwsTtsController extends ChangeNotifier {
   final AudioRecorder _recorder = AudioRecorder();
   StreamSubscription<Uint8List>? _audioSub;
   KwsEngine? _kwsEngine;
+  Timer? _audioHealthCheck; // Monitor if audio stream is alive
 
   KwsState _kwsState = KwsState.idle;
   String _lastDetectedWord = '';
   final List<KwsDetectionEvent> _detectionHistory = [];
   String? _kwsError;
+  DateTime? _lastAudioReceived; // Track last time we got audio data
 
   // Keywords — same format as WordDetectionController
   final List<String> keywords = const ['▁ST O P', '▁HE LL O', '▁HO L D ▁ON'];
 
   // ── TTS ──────────────────────────────────────────────────────────────────
-  final AudioPlayer _player = AudioPlayer();
+  late final AudioPlayer _player = AudioPlayer(
+    // Let the player run but don't let it interrupt other audio
+    handleInterruptions: false,
+    androidApplyAudioAttributes:
+        true, // Changed: we need to apply custom attributes
+    handleAudioSessionActivation: false,
+    audioLoadConfiguration: const AudioLoadConfiguration(
+      androidLoadControl: AndroidLoadControl(
+        // Prevent buffering from causing issues
+        // minBufferDuration must be >= bufferForPlaybackMs and bufferForPlaybackAfterRebufferMs
+        minBufferDuration: Duration(milliseconds: 2500),
+        maxBufferDuration: Duration(seconds: 5),
+        bufferForPlaybackDuration: Duration(milliseconds: 500),
+        bufferForPlaybackAfterRebufferDuration: Duration(milliseconds: 1000),
+      ),
+    ),
+  );
   TtsEngine? _ttsEngine;
 
   TtsState _ttsState = TtsState.idle;
@@ -165,22 +183,40 @@ class VadKwsTtsController extends ChangeNotifier {
           encoder: AudioEncoder.pcm16bits,
           numChannels: 1,
           sampleRate: _sampleRate,
-          autoGain: true,
-          echoCancel: true,
-          noiseSuppress: true,
+          autoGain: false,
+          echoCancel: false,
+          noiseSuppress: false,
+          androidConfig: AndroidRecordConfig(
+            // CRITICAL: Use VOICE_RECOGNITION source - it doesn't pause on audio focus loss
+            // and is designed to work while other audio plays
+            audioSource: AndroidAudioSource.voiceRecognition,
+          ),
         ),
       );
 
       _audioSub = stream.listen(
         _onAudioData,
         onError: (Object err) {
+          debugPrint('[KWS] ❌ Audio stream error: $err');
           _kwsError = err.toString();
           notifyListeners();
         },
+        onDone: () {
+          debugPrint('[KWS] ⚠️ Audio stream closed unexpectedly');
+          if (_kwsState == KwsState.listening) {
+            _kwsError = 'Audio stream stopped unexpectedly';
+            _kwsState = KwsState.idle;
+            notifyListeners();
+          }
+        },
+        cancelOnError: false,
       );
 
       _kwsState = KwsState.listening;
       notifyListeners();
+
+      // Start health check timer to detect if audio stream stops
+      _startAudioHealthCheck();
     } catch (e) {
       _kwsError = e.toString();
       _kwsState = KwsState.idle;
@@ -189,6 +225,9 @@ class VadKwsTtsController extends ChangeNotifier {
   }
 
   Future<void> stopKws() async {
+    _audioHealthCheck?.cancel();
+    _audioHealthCheck = null;
+    _lastAudioReceived = null;
     await _audioSub?.cancel();
     _audioSub = null;
     await _recorder.stop();
@@ -196,6 +235,78 @@ class VadKwsTtsController extends ChangeNotifier {
     _kwsState = KwsState.idle;
     _lastDetectedWord = '';
     notifyListeners();
+  }
+
+  void _startAudioHealthCheck() {
+    _lastAudioReceived = DateTime.now();
+    _audioHealthCheck?.cancel();
+    _audioHealthCheck = Timer.periodic(const Duration(seconds: 1), (timer) {
+      final now = DateTime.now();
+      final lastReceived = _lastAudioReceived;
+
+      if (lastReceived != null &&
+          now.difference(lastReceived).inSeconds > 2 &&
+          _kwsState == KwsState.listening) {
+        debugPrint(
+            '[KWS] ⚠️ No audio received for 2s - audio focus likely lost. Attempting restart...');
+        _restartKwsRecording();
+      }
+    });
+  }
+
+  Future<void> _restartKwsRecording() async {
+    debugPrint('[KWS] 🔄 Restarting recording...');
+
+    try {
+      // Don't change state - keep it as "listening"
+      await _audioSub?.cancel();
+      _audioSub = null;
+      await _recorder.stop();
+
+      // Small delay
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      // Restart stream
+      final stream = await _recorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          numChannels: 1,
+          sampleRate: _sampleRate,
+          autoGain: false,
+          echoCancel: false,
+          noiseSuppress: false,
+          androidConfig: AndroidRecordConfig(
+            audioSource: AndroidAudioSource.voiceRecognition,
+          ),
+        ),
+      );
+
+      _audioSub = stream.listen(
+        _onAudioData,
+        onError: (Object err) {
+          debugPrint('[KWS] ❌ Audio stream error: $err');
+          _kwsError = err.toString();
+          notifyListeners();
+        },
+        onDone: () {
+          debugPrint('[KWS] ⚠️ Audio stream closed unexpectedly');
+          if (_kwsState == KwsState.listening) {
+            _kwsError = 'Audio stream stopped unexpectedly';
+            _kwsState = KwsState.idle;
+            notifyListeners();
+          }
+        },
+        cancelOnError: false,
+      );
+
+      _lastAudioReceived = DateTime.now();
+      debugPrint('[KWS] ✅ Recording restarted successfully');
+    } catch (e) {
+      debugPrint('[KWS] ❌ Failed to restart recording: $e');
+      _kwsError = 'Failed to restart: $e';
+      _kwsState = KwsState.idle;
+      notifyListeners();
+    }
   }
 
   Future<void> _ensureKwsEngine() async {
@@ -213,8 +324,13 @@ class VadKwsTtsController extends ChangeNotifier {
 
   void _onAudioData(Uint8List data) {
     if (_kwsEngine == null || data.isEmpty) return;
+
+    _lastAudioReceived = DateTime.now(); // Update last received timestamp
+    debugPrint('[KWS] 📡 Received audio: ${data.length} bytes');
+
     final samples = pcm16BytesToFloat32(data);
     final detected = _kwsEngine!.update(samples: samples);
+
     if (detected != null && detected.isNotEmpty) {
       debugPrint('[KWS] ✅ DETECTED: "$detected"  ttsPlaying=$ttsRunning');
       _lastDetectedWord = detected;
@@ -255,6 +371,14 @@ class VadKwsTtsController extends ChangeNotifier {
       if (_ttsEngine == null) return; // init failed, error already set
     }
 
+    // Reconfigure audio session to ensure playback goes to speaker
+    // and doesn't interrupt the mic recording.
+    try {
+      await AudioSessionManager.configure();
+    } catch (e) {
+      debugPrint('[TTS] Warning: Failed to configure audio session: $e');
+    }
+
     final thisToken = ++_ttsToken;
     _ttsState = TtsState.synthesising;
     _ttsStatusDetail = 'Synthesising…';
@@ -283,11 +407,17 @@ class VadKwsTtsController extends ChangeNotifier {
 
         if (firstChunk) {
           firstChunk = false;
+
+          // Set audio attributes to NOT request audio focus
+          // This prevents the recorder from being paused
           await _player.setAudioSource(
             playlist,
             initialIndex: 0,
             initialPosition: Duration.zero,
+            preload: false, // Don't preload to avoid early focus request
           );
+
+          // Now play without requesting focus
           unawaited(_player.play());
           _ttsState = TtsState.playing;
           _ttsStatusDetail = 'Playing chunk 1…';
@@ -328,6 +458,7 @@ class VadKwsTtsController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _audioHealthCheck?.cancel();
     _audioSub?.cancel();
     _recorder.dispose();
     _kwsEngine?.dispose();

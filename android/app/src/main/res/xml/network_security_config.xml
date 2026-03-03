@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Allows just_audio's StreamAudioSource to serve audio via its local HTTP
+  server on 127.0.0.1 without being blocked by Android's cleartext policy.
+  Only localhost is whitelisted — all other traffic remains encrypted.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>

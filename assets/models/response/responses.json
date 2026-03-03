@@ -1,0 +1,30 @@
+[
+  {
+    "id": "en_greeting_1",
+    "language": "en-US",
+    "intent": "greeting",
+    "text": "Hi there. How can I help you today?",
+    "required_slots": []
+  },
+  {
+    "id": "en_help_1",
+    "language": "en-US",
+    "intent": "help",
+    "text": "I can help with account info, quick questions, and simple tasks. What do you need?",
+    "required_slots": []
+  },
+  {
+    "id": "es_greeting_1",
+    "language": "es-MX",
+    "intent": "greeting",
+    "text": "Hola. En que puedo ayudarte?",
+    "required_slots": []
+  },
+  {
+    "id": "fr_greeting_1",
+    "language": "fr-CA",
+    "intent": "greeting",
+    "text": "Bonjour. Comment puis-je vous aider?",
+    "required_slots": []
+  }
+]

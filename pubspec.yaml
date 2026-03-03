@@ -1,0 +1,80 @@
+name: voice_agent_flutter
+description: Offline multilingual voice agent (EN/ES/FR) with barge-in
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  sherpa_onnx: ^1.12.26
+  record: ^5.2.1
+  just_audio: ^0.9.36
+  audio_session: ^0.1.21
+  tflite_flutter: ^0.12.1
+  path_provider: ^2.1.2
+  path: ^1.9.0
+
+dependency_overrides:
+  record_linux: ^1.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/README.md
+    - assets/models/asr/en/
+    - assets/models/asr/es/
+    - assets/models/asr/fr/
+    - assets/models/intent/en/
+    - assets/models/intent/es/
+    - assets/models/intent/fr/
+    - assets/models/slots/en/
+    - assets/models/slots/es/
+    - assets/models/slots/fr/
+    - assets/models/response/
+    - assets/models/vad/
+    - assets/models/kws/
+    - assets/models/tts/piper-lessac/
+    - assets/models/tts/piper-lessac/espeak-ng-data/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/aav/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/art/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/azc/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/bat/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/bnt/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/ccs/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/cel/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/cus/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/dra/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/esx/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/gmq/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/gmw/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/grk/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/inc/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/ine/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/ira/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/iro/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/itc/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/jpx/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/map/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/miz/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/myn/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/poz/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/roa/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/sai/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/sem/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/sit/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/tai/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/trk/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/urj/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/zle/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/zls/
+    - assets/models/tts/piper-lessac/espeak-ng-data/lang/zlw/
+    - assets/models/tts/piper-lessac/espeak-ng-data/voices/!v/

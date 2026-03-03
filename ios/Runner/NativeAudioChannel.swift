@@ -151,14 +151,23 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  activateSession  — shared helper, always .default + defaultToSpeaker
+    //  activateSession  — shared helper
+    //
+    //  mode: .voiceChat  ← activates Apple's built-in Acoustic Echo
+    //  Cancellation (AEC) / Voice Processing I/O unit.  This is what makes
+    //  ChatGPT-style simultaneous loud-speaker playback + clean mic capture
+    //  possible: the DSP cancels speaker bleed so KWS only hears the user.
+    //
+    //  .defaultToSpeaker  ← routes output to speaker (loud) by default,
+    //  identical to overrideOutputAudioPort(.speaker) but set at category
+    //  level so it survives session reactivations.
     // ─────────────────────────────────────────────────────────────────────
     private func activateSession() throws {
         let s = AVAudioSession.sharedInstance()
-        try s.setCategory(.playAndRecord, mode: .default,
+        try s.setCategory(.playAndRecord, mode: .voiceChat,
                           options: [.allowBluetooth, .defaultToSpeaker])
         try s.setActive(true)
-       
+
         print("[NativeAudio] session active: sr=\(s.sampleRate) route=\(s.currentRoute.outputs.map{$0.portType.rawValue})")
     }
 
@@ -353,14 +362,16 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
 
     // ─────────────────────────────────────────────────────────────────────
     //  setSpeaker
-    //  Uses .default mode + overrideOutputAudioPort for both paths.
-    //  Avoids .voiceChat / .videoChat which force system-level routing.
+    //  Keeps mode: .voiceChat so AEC stays active regardless of routing.
+    //  .defaultToSpeaker is already set at category level; for earpiece we
+    //  use overrideOutputAudioPort(.none).
     // ─────────────────────────────────────────────────────────────────────
     private func setSpeaker(enabled: Bool, result: FlutterResult) {
         print("[NativeAudio] setSpeaker() enabled=\(enabled)")
         do {
             let s = AVAudioSession.sharedInstance()
-            try s.setCategory(.playAndRecord, mode: .default,
+            // Re-apply category with voiceChat mode to keep AEC active
+            try s.setCategory(.playAndRecord, mode: .voiceChat,
                               options: [.allowBluetooth, .defaultToSpeaker])
             try s.setActive(true)
             try s.overrideOutputAudioPort(enabled ? .speaker : .none)

@@ -113,7 +113,8 @@ class VadKwsTtsController extends ChangeNotifier {
   String _ttsStatusDetail = '';
 
   // ── Speaker Toggle ───────────────────────────────────────────────────────
-  bool _isSpeakerOn = false; // Start with earpiece (speaker off)
+  bool _isSpeakerOn =
+      true; // Speaker on by default (matches .defaultToSpeaker in AVAudioSession)
 
   // ── Constructor ──────────────────────────────────────────────────────────
   VadKwsTtsController(); // No automatic speaker override - user controls it manually
@@ -341,11 +342,21 @@ class VadKwsTtsController extends ChangeNotifier {
     final detected = _kwsEngine!.update(samples: samples);
 
     if (detected != null && detected.isNotEmpty) {
-      debugPrint('[KWS] ✅ DETECTED: "$detected"  ttsPlaying=$ttsRunning');
+      final wasTtsRunning = ttsRunning;
+      debugPrint('[KWS] ✅ DETECTED: "$detected"  ttsPlaying=$wasTtsRunning');
+
+      // ── Interruption: stop TTS immediately when keyword is detected ──────
+      // This mirrors ChatGPT-style behaviour — the user's keyword cuts the
+      // agent's speech right away.
+      if (wasTtsRunning) {
+        debugPrint('[KWS] 🛑 Keyword interrupted TTS — stopping playback');
+        _stopTtsImmediately();
+      }
+
       _lastDetectedWord = detected;
       _detectionHistory.insert(
         0,
-        KwsDetectionEvent(keyword: detected, duringTts: ttsRunning),
+        KwsDetectionEvent(keyword: detected, duringTts: wasTtsRunning),
       );
       if (_detectionHistory.length > 50) _detectionHistory.removeLast();
       notifyListeners();
@@ -358,6 +369,24 @@ class VadKwsTtsController extends ChangeNotifier {
         }
       });
     }
+  }
+
+  /// Stops TTS synchronously from the audio callback thread.
+  /// Increments the token first so the in-flight [startTts] loop exits on
+  /// its next iteration, then fires the async native stop in the background.
+  void _stopTtsImmediately() {
+    _ttsToken++; // invalidates the in-flight startTts loop
+    _ttsEngine?.stopStream();
+    _ttsState = TtsState.stopped;
+    _ttsStatusDetail = 'Interrupted by keyword.';
+    notifyListeners();
+
+    // Fire-and-forget: flush native player buffers + reset state to idle
+    _NativeAudio.stopPlayback().then((_) {
+      _ttsState = TtsState.idle;
+      _ttsStatusDetail = '';
+      notifyListeners();
+    });
   }
 
   void clearHistory() {

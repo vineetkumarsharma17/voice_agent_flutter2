@@ -43,6 +43,15 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     //   • playbackEngine runs continuously once started; never stopped by KWS
     //   • recordEngine starts/stops independently for the mic tap
     //   • KWS and TTS can run truly simultaneously with no interference
+    //
+    //  AEC strategy — mode: .default  (full output volume, no ducking)
+    //   • mode: .voiceChat gives AEC but ducks output to ~50% — unusable for
+    //     loud TTS playback.
+    //   • Instead we use mode: .default and enable the Voice Processing I/O
+    //     AudioUnit directly on the recordEngine's inputNode via
+    //     AVAudioSession.setVoiceProcessingEnabled. This activates Apple's
+    //     hardware AEC on the capture path only, leaving the playback path
+    //     completely unaffected at full volume.
     private let playbackEngine = AVAudioEngine()
     private let recordEngine   = AVAudioEngine()
     private let playerNode     = AVAudioPlayerNode()
@@ -153,18 +162,22 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     // ─────────────────────────────────────────────────────────────────────
     //  activateSession  — shared helper
     //
-    //  mode: .voiceChat  ← activates Apple's built-in Acoustic Echo
-    //  Cancellation (AEC) / Voice Processing I/O unit.  This is what makes
-    //  ChatGPT-style simultaneous loud-speaker playback + clean mic capture
-    //  possible: the DSP cancels speaker bleed so KWS only hears the user.
+    //  mode: .default  ← full output volume, no AGC ducking.
+    //                    This is critical — .voiceChat silently ducks the
+    //                    speaker to ~50% which makes TTS too quiet.
     //
-    //  .defaultToSpeaker  ← routes output to speaker (loud) by default,
-    //  identical to overrideOutputAudioPort(.speaker) but set at category
-    //  level so it survives session reactivations.
+    //  Voice Processing (AEC) is enabled separately via
+    //  AVAudioSession.setVoiceProcessingEnabled(true) in startRecording().
+    //  That API activates Apple's hardware AEC on the capture path only,
+    //  without touching the playback volume at all. This is exactly the
+    //  ChatGPT-style pattern: loud speaker + clean mic.
+    //
+    //  .defaultToSpeaker  ← routes output to the bottom speaker at full
+    //  volume when no headphones are connected.
     // ─────────────────────────────────────────────────────────────────────
     private func activateSession() throws {
         let s = AVAudioSession.sharedInstance()
-        try s.setCategory(.playAndRecord, mode: .voiceChat,
+        try s.setCategory(.playAndRecord, mode: .default,
                           options: [.allowBluetooth, .defaultToSpeaker])
         try s.setActive(true)
 
@@ -198,7 +211,9 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     //      Any explicit format risks a "format mismatch" crash.
     //   2. If engine is already running (TTS playing), stop it first,
     //      install the tap, then restart — new tap nodes need a restart.
-    //   3. engine.start() goes AFTER installTap.
+    //   3. Enable Voice Processing on the inputNode BEFORE engine.start()
+    //      so the AEC DSP is wired in from the first sample.
+    //   4. engine.start() goes AFTER installTap.
     // ─────────────────────────────────────────────────────────────────────
     private func startRecording(result: FlutterResult) {
         print("[NativeAudio] startRecording() isRecording=\(isRecording) recEngineRunning=\(recordEngine.isRunning)")
@@ -220,7 +235,23 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
                               userInfo: [NSLocalizedDescriptionKey: "Cannot create 16kHz PCM-16 format"])
             }
 
-            // nil format → engine picks native hw format
+            // ── Enable Voice Processing (AEC) on the input node ───────────
+            // This activates Apple's hardware Acoustic Echo Cancellation on
+            // the capture path only. The playback engine is completely
+            // unaffected — output stays at full volume with no ducking.
+            // Must be called BEFORE installTap so the VP I/O unit is the
+            // active input node when the tap format is queried.
+            if #available(iOS 14.0, *) {
+                do {
+                    try recordEngine.inputNode.setVoiceProcessingEnabled(true)
+                    print("[NativeAudio] startRecording() Voice Processing (AEC) enabled ✅")
+                } catch {
+                    // Non-fatal — AEC unavailable (e.g. simulator), continue
+                    print("[NativeAudio] startRecording() VP enable failed (non-fatal): \(error)")
+                }
+            }
+
+            // nil format → engine picks native hw format (with VP if enabled)
             recordEngine.inputNode.installTap(onBus: 0, bufferSize: tapBufferSize,
                                               format: nil) { [weak self] buf, _ in
                 guard let self = self, let tgt = self.recordTargetFmt else { return }
@@ -250,7 +281,7 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
 
     // ─────────────────────────────────────────────────────────────────────
     //  stopRecording
-    //  Removes the mic tap and stops the engine.
+    //  Removes the mic tap, disables Voice Processing, and stops the engine.
     //
     //  Session stays .playAndRecord — we MUST NOT switch to .playback here.
     //  AVAudioEngine's inputNode is permanently wired into the graph; if
@@ -265,6 +296,13 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
         guard isRecording else { result(true); return }
 
         recordEngine.inputNode.removeTap(onBus: 0)
+
+        // Disable Voice Processing so it doesn't affect the next session
+        if #available(iOS 14.0, *) {
+            try? recordEngine.inputNode.setVoiceProcessingEnabled(false)
+            print("[NativeAudio] stopRecording() Voice Processing disabled")
+        }
+
         isRecording = false
         recordEngineReady = false
         recordEngine.stop()
@@ -362,16 +400,15 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
 
     // ─────────────────────────────────────────────────────────────────────
     //  setSpeaker
-    //  Keeps mode: .voiceChat so AEC stays active regardless of routing.
+    //  Uses mode: .default to keep full output volume.
     //  .defaultToSpeaker is already set at category level; for earpiece we
-    //  use overrideOutputAudioPort(.none).
+    //  use overrideOutputAudioPort(.none) to cancel the speaker override.
     // ─────────────────────────────────────────────────────────────────────
     private func setSpeaker(enabled: Bool, result: FlutterResult) {
         print("[NativeAudio] setSpeaker() enabled=\(enabled)")
         do {
             let s = AVAudioSession.sharedInstance()
-            // Re-apply category with voiceChat mode to keep AEC active
-            try s.setCategory(.playAndRecord, mode: .voiceChat,
+            try s.setCategory(.playAndRecord, mode: .default,
                               options: [.allowBluetooth, .defaultToSpeaker])
             try s.setActive(true)
             try s.overrideOutputAudioPort(enabled ? .speaker : .none)

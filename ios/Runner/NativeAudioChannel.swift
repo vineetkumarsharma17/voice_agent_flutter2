@@ -28,11 +28,27 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     private var eventChannel:  FlutterEventChannel?
     private var eventSink:     FlutterEventSink?
 
-    // ── Audio engine ──────────────────────────────────────────────────────
-    private let engine     = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
-    private var isRecording = false
-    private var engineReady = false
+    // ── Audio engines ─────────────────────────────────────────────────────
+    //  Two separate AVAudioEngine instances — one for playback, one for
+    //  recording. This is the key architectural decision:
+    //
+    //  Single-engine approach (previous) caused:
+    //   • startRecording had to stop the engine (topology change for tap)
+    //     which killed any in-progress TTS playback → silence
+    //   • stopRecording stopped the engine → TTS couldn't start until
+    //     playWav restarted it, losing the first chunk
+    //   • playerNode.isPlaying state was reset every time the engine stopped
+    //
+    //  Two-engine approach:
+    //   • playbackEngine runs continuously once started; never stopped by KWS
+    //   • recordEngine starts/stops independently for the mic tap
+    //   • KWS and TTS can run truly simultaneously with no interference
+    private let playbackEngine = AVAudioEngine()
+    private let recordEngine   = AVAudioEngine()
+    private let playerNode     = AVAudioPlayerNode()
+    private var isRecording       = false
+    private var playbackReady     = false
+    private var recordEngineReady = false
 
     // Playback format — must match piper-lessac TTS WAV output
     private let playbackSampleRate: Double = 22050
@@ -106,16 +122,25 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  configure
-    //  Activates AVAudioSession and wires the engine graph.
-    //  Does NOT start the engine — callers (playWav / startRecording) do that
-    //  because each needs a different graph topology (with/without input tap).
+    //  configure — activates session, wires + STARTS playbackEngine eagerly.
+    //  playbackEngine stays running permanently so playWav can schedule
+    //  buffers at any time without racing against engine start.
     // ─────────────────────────────────────────────────────────────────────
     private func configure(result: FlutterResult) {
-        print("[NativeAudio] configure() engineReady=\(engineReady)")
+        print("[NativeAudio] configure() playbackReady=\(playbackReady) running=\(playbackEngine.isRunning)")
         do {
             try activateSession()
-            if !engineReady { try setupEngine() }
+            if !playbackReady { try setupPlaybackEngine() }
+            // Start eagerly so playWav never has to start it mid-stream
+            if !playbackEngine.isRunning {
+                try playbackEngine.start()
+                print("[NativeAudio] configure() playbackEngine started")
+            }
+            // NOTE: do NOT call playerNode.play() here — calling play() with
+            // no buffers queued puts the node into a "starved" state where
+            // subsequent scheduleBuffer calls are silently dropped.
+            // playerNode.play() is called in playWav() right before the first
+            // buffer is scheduled, which is the correct AVAudioPlayerNode pattern.
             print("[NativeAudio] configure() DONE")
             result(true)
         } catch {
@@ -133,29 +158,17 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
         try s.setCategory(.playAndRecord, mode: .default,
                           options: [.allowBluetooth, .defaultToSpeaker])
         try s.setActive(true)
+       
         print("[NativeAudio] session active: sr=\(s.sampleRate) route=\(s.currentRoute.outputs.map{$0.portType.rawValue})")
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  setupEngine  — attach + connect playerNode; does NOT start the engine.
-    //
-    //  IMPORTANT: AVAudioEngine ALWAYS includes the inputNode in the graph.
-    //  Calling engine.reset() forces a full graph teardown — after that,
-    //  engine.start() / engine.prepare() run InitializeActiveNodesInInputChain
-    //  which tries to bring up the mic hardware. If the session is .playback
-    //  only (no mic access), this crashes with -10868.
-    //
-    //  Therefore we NEVER call engine.reset(). We keep the session as
-    //  .playAndRecord at all times so the input node can always initialize,
-    //  and we only add/remove the tap to control whether mic data flows.
+    //  setupPlaybackEngine — wires playerNode into playbackEngine only.
+    //  Never touches recordEngine.
     // ─────────────────────────────────────────────────────────────────────
-    private func setupEngine() throws {
-        print("[NativeAudio] setupEngine()")
-        engine.attach(playerNode)
-
-        // Connect playerNode → mainMixerNode with the explicit Float32 format
-        // that we convert all WAV buffers into before scheduling.
-        // This must match the format passed to AVAudioConverter in playWav().
+    private func setupPlaybackEngine() throws {
+        print("[NativeAudio] setupPlaybackEngine()")
+        playbackEngine.attach(playerNode)
         guard let playFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                           sampleRate: playbackSampleRate,
                                           channels: playbackChannels,
@@ -163,10 +176,9 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
             throw NSError(domain: "NativeAudio", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "Cannot create playback format"])
         }
-        engine.connect(playerNode, to: engine.mainMixerNode, format: playFmt)
-        print("[NativeAudio] setupEngine() playFmt=\(playFmt.sampleRate)Hz \(playFmt.channelCount)ch Float32")
-        engine.prepare()
-        engineReady = true
+        playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playFmt)
+        print("[NativeAudio] setupPlaybackEngine() fmt=\(playFmt.sampleRate)Hz Float32")
+        playbackReady = true
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -180,22 +192,18 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     //   3. engine.start() goes AFTER installTap.
     // ─────────────────────────────────────────────────────────────────────
     private func startRecording(result: FlutterResult) {
-        print("[NativeAudio] startRecording() isRecording=\(isRecording) engineRunning=\(engine.isRunning)")
+        print("[NativeAudio] startRecording() isRecording=\(isRecording) recEngineRunning=\(recordEngine.isRunning)")
         guard !isRecording else { result(true); return }
         do {
-            // Session must be .playAndRecord — the engine's inputNode is always
-            // part of the graph and CoreAudio will try to initialize it on
-            // engine.start(). If the session doesn't allow input, you get -10868.
             try activateSession()
-            if !engineReady { try setupEngine() }
 
-            // Remove any stale tap before installing a new one
-            engine.inputNode.removeTap(onBus: 0)
+            // Remove any stale tap
+            recordEngine.inputNode.removeTap(onBus: 0)
 
-            // Stop the engine — required before any topology change (new tap).
-            if engine.isRunning {
-                engine.stop()
-                print("[NativeAudio] startRecording() engine stopped to apply tap")
+            // Stop recordEngine if running before installing new tap
+            if recordEngine.isRunning {
+                recordEngine.stop()
+                print("[NativeAudio] startRecording() recordEngine stopped to apply tap")
             }
 
             guard let targetFmt = recordTargetFmt else {
@@ -203,9 +211,9 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
                               userInfo: [NSLocalizedDescriptionKey: "Cannot create 16kHz PCM-16 format"])
             }
 
-            // nil format → engine delivers buffers in native hw format
-            engine.inputNode.installTap(onBus: 0, bufferSize: tapBufferSize,
-                                        format: nil) { [weak self] buf, _ in
+            // nil format → engine picks native hw format
+            recordEngine.inputNode.installTap(onBus: 0, bufferSize: tapBufferSize,
+                                              format: nil) { [weak self] buf, _ in
                 guard let self = self, let tgt = self.recordTargetFmt else { return }
                 guard let converted = self.convertBuffer(buf, to: tgt) else { return }
                 let data = self.pcmBufferToData(converted)
@@ -215,12 +223,14 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
                 }
             }
 
-            let actualFmt = engine.inputNode.outputFormat(forBus: 0)
-            print("[NativeAudio] startRecording() tap installed hw=\(actualFmt.sampleRate)Hz \(actualFmt.channelCount)ch")
+            let actualFmt = recordEngine.inputNode.outputFormat(forBus: 0)
+            print("[NativeAudio] startRecording() tap hw=\(actualFmt.sampleRate)Hz \(actualFmt.channelCount)ch")
 
-            try engine.start()
+            try activateSession()  // re-activate right before start
+            try recordEngine.start()
             isRecording = true
-            print("[NativeAudio] startRecording() DONE engine running")
+            recordEngineReady = true
+            print("[NativeAudio] startRecording() DONE recordEngine running")
             result(true)
         } catch {
             print("[NativeAudio] startRecording() FAILED: \(error)")
@@ -245,26 +255,16 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
         print("[NativeAudio] stopRecording() isRecording=\(isRecording)")
         guard isRecording else { result(true); return }
 
-        // 1. Remove the mic tap — this is what iOS uses to decide whether
-        //    the mic indicator (red dot) should show. No tap = no indicator.
-        engine.inputNode.removeTap(onBus: 0)
+        recordEngine.inputNode.removeTap(onBus: 0)
         isRecording = false
-        print("[NativeAudio] stopRecording() tap removed")
+        recordEngineReady = false
+        recordEngine.stop()
+        print("[NativeAudio] stopRecording() recordEngine stopped, tap removed")
 
-        // 2. Stop the engine (playWav will restart it when needed)
-        engine.stop()
-        print("[NativeAudio] stopRecording() engine stopped")
-
-        // 3. Keep session as .playAndRecord so the next engine.start()
-        //    (from playWav or startRecording) can initialize the input node
-        //    without hitting -10868.
-        //    activateSession() sets .playAndRecord — call it to refresh.
-        do {
-            try activateSession()
-        } catch {
+        // Refresh session — playbackEngine continues running unaffected
+        do { try activateSession() } catch {
             print("[NativeAudio] stopRecording() session refresh failed: \(error)")
         }
-
         result(true)
     }
 
@@ -279,19 +279,17 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     //  before scheduling — otherwise the bytes are reinterpreted → noise.
     // ─────────────────────────────────────────────────────────────────────
     private func playWav(data: Data, result: FlutterResult) {
-        print("[NativeAudio] playWav() \(data.count)B engineReady=\(engineReady) running=\(engine.isRunning)")
+        print("[NativeAudio] playWav() \(data.count)B playbackReady=\(playbackReady) running=\(playbackEngine.isRunning)")
         do {
-            if !engineReady {
+            // Ensure playbackEngine is set up and running
+            if !playbackReady {
                 try activateSession()
-                try setupEngine()
+                try setupPlaybackEngine()
             }
-            // Engine stopped (e.g. after stopRecording). Session is already
-            // .playAndRecord (stopRecording keeps it that way), so we can
-            // start directly — the input node will initialize cleanly.
-            if !engine.isRunning {
+            if !playbackEngine.isRunning {
                 try activateSession()
-                try engine.start()
-                print("[NativeAudio] playWav() engine started")
+                try playbackEngine.start()
+                print("[NativeAudio] playWav() playbackEngine restarted")
             }
 
             guard let rawBuffer = try wavDataToPCMBuffer(data) else {
@@ -301,9 +299,6 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
                                     details: nil)); return
             }
 
-            // Convert to Float32 @ playbackSampleRate — must match the format
-            // the playerNode was connected with in setupEngine().
-            // AVAudioPlayerNode does NOT auto-convert; wrong format = noise.
             guard let playFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                               sampleRate: playbackSampleRate,
                                               channels: playbackChannels,
@@ -314,24 +309,26 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
 
             let buffer: AVAudioPCMBuffer
             if rawBuffer.format == playFmt {
-                buffer = rawBuffer  // already the right format
+                buffer = rawBuffer
             } else {
                 guard let converted = convertBuffer(rawBuffer, to: playFmt) else {
                     result(FlutterError(code: "PLAY_ERROR",
-                                        message: "Format conversion failed \(rawBuffer.format.sampleRate)Hz \(rawBuffer.format.commonFormat.rawValue) → Float32@\(playbackSampleRate)",
+                                        message: "Format conversion failed \(rawBuffer.format.sampleRate)Hz → Float32@\(playbackSampleRate)",
                                         details: nil)); return
                 }
-                print("[NativeAudio] playWav() converted \(rawBuffer.format.sampleRate)Hz \(rawBuffer.format.commonFormat.rawValue == 3 ? "Int16" : "other") → Float32@\(playbackSampleRate)")
+                print("[NativeAudio] playWav() converted \(rawBuffer.format.sampleRate)Hz → Float32@\(playbackSampleRate)")
                 buffer = converted
             }
 
-            let bFmt = buffer.format
-            print("[NativeAudio] playWav() scheduling: \(buffer.frameLength)fr \(bFmt.sampleRate)Hz \(bFmt.channelCount)ch Float32")
-
+            print("[NativeAudio] playWav() scheduling \(buffer.frameLength)fr @ \(buffer.format.sampleRate)Hz")
+            // Always ensure playerNode is in playing state right before
+            // scheduling. If stopPlayback() was called, playerNode.stop()
+            // exits the playing state — play() here re-enters it so the
+            // buffer renders immediately.
+            if !playerNode.isPlaying { playerNode.play() }
             playerNode.scheduleBuffer(buffer) {
                 print("[NativeAudio] playWav() chunk done \(buffer.frameLength)fr")
             }
-            if !playerNode.isPlaying { playerNode.play() }
             result(true)
         } catch {
             print("[NativeAudio] playWav() FAILED: \(error)")
@@ -345,6 +342,11 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
     // ─────────────────────────────────────────────────────────────────────
     private func stopPlayback(result: FlutterResult) {
         print("[NativeAudio] stopPlayback()")
+        // stop() flushes all pending scheduled buffers and dequeues everything.
+        // We do NOT call playerNode.play() here — the node will be put back
+        // into playing state by the next playWav() call. Calling play() on a
+        // node with no buffers queued immediately puts it into a "starved"
+        // state where subsequent scheduleBuffer calls are silently dropped.
         playerNode.stop()
         result(true)
     }
@@ -407,16 +409,20 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
                         .flatMap(AVAudioSession.InterruptionType.init(rawValue:)) else { return }
         switch t {
         case .began:
-            print("[NativeAudio] interruption BEGAN engine=\(engine.isRunning)")
+            print("[NativeAudio] interruption BEGAN playback=\(playbackEngine.isRunning) record=\(recordEngine.isRunning)")
         case .ended:
             let opts = AVAudioSession.InterruptionOptions(
                 rawValue: info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
             print("[NativeAudio] interruption ENDED shouldResume=\(opts.contains(.shouldResume))")
-            guard opts.contains(.shouldResume), engineReady else { return }
+            guard opts.contains(.shouldResume) else { return }
             do {
                 try activateSession()
-                if !engine.isRunning { try engine.start() }
-                print("[NativeAudio] interruption: engine resumed")
+                if playbackReady && !playbackEngine.isRunning {
+                    try playbackEngine.start()
+                    if !playerNode.isPlaying { playerNode.play() }
+                }
+                if recordEngineReady && !recordEngine.isRunning { try recordEngine.start() }
+                print("[NativeAudio] interruption: engines resumed")
             } catch {
                 print("[NativeAudio] interruption resume failed: \(error)")
             }
@@ -430,16 +436,16 @@ private let kEventChannel  = "com.voiceagent/native_audio_stream"
         print("[NativeAudio] routeChange reason=\(reason) outputs=\(outs)")
 
         // reason 2 = oldDeviceUnavailable (headphones unplugged, BT disconnected)
-        // The engine's output node format is now invalid — must restart.
-        if reason == 2 && engineReady {
-            print("[NativeAudio] routeChange: device removed, restarting engine")
-            engine.stop()
+        if reason == 2 && playbackReady {
+            print("[NativeAudio] routeChange: device removed, restarting playbackEngine")
+            playbackEngine.stop()
             do {
                 try activateSession()
-                try engine.start()
-                print("[NativeAudio] routeChange: engine restarted")
+                try playbackEngine.start()
+                if !playerNode.isPlaying { playerNode.play() }
+                print("[NativeAudio] routeChange: playbackEngine restarted")
             } catch {
-                print("[NativeAudio] routeChange: engine restart failed: \(error)")
+                print("[NativeAudio] routeChange: playbackEngine restart failed: \(error)")
             }
         }
     }

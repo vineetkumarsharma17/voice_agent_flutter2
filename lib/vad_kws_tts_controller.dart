@@ -145,25 +145,21 @@ class VadKwsTtsController extends ChangeNotifier {
   Future<void> initEngines() async {
     // Run both initialisations concurrently; failures are surfaced via the
     // respective error fields so the UI can show them independently.
-    // TODO: KWS init commented out to isolate white-screen crash
-    // await Future.wait([_initKwsEngine(), _initTtsEngine()]);
-    await _initTtsEngine();
+    await Future.wait([_initKwsEngine(), _initTtsEngine()]);
   }
 
-  // ignore: unused_element
   Future<void> _initKwsEngine() async {
-    // TODO: commented out for crash isolation
-    // if (_kwsEngine != null) return;
-    // _kwsState = KwsState.loading;
-    // notifyListeners();
-    // try {
-    //   await _ensureKwsEngine();
-    //   _kwsState = KwsState.idle;
-    // } catch (e) {
-    //   _kwsError = 'KWS init failed: $e';
-    //   _kwsState = KwsState.idle;
-    // }
-    // notifyListeners();
+    if (_kwsEngine != null) return;
+    _kwsState = KwsState.loading;
+    notifyListeners();
+    try {
+      await _ensureKwsEngine();
+      _kwsState = KwsState.idle;
+    } catch (e) {
+      _kwsError = 'KWS init failed: $e';
+      _kwsState = KwsState.idle;
+    }
+    notifyListeners();
   }
 
   Future<void> _initTtsEngine() async {
@@ -194,15 +190,18 @@ class VadKwsTtsController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // Configure native AVAudioSession (Swift side owns it entirely)
-      await _NativeAudio.configure();
-
-      // If engine somehow not loaded yet, load it now.
+      // Load the KWS engine FIRST — model loading can disturb CoreAudio
+      // session state on iOS. configure() must come AFTER so the session
+      // is activated as close as possible to startRecording().
       if (_kwsEngine == null) {
         _kwsState = KwsState.loading;
         notifyListeners();
         await _ensureKwsEngine();
       }
+
+      // Configure native AVAudioSession (Swift side owns it entirely).
+      // Called after KWS model load to ensure session is fresh.
+      await _NativeAudio.configure();
 
       // Check / request mic permission through native channel
       final ok = await _NativeAudio.hasPermission().then(
@@ -263,14 +262,14 @@ class VadKwsTtsController extends ChangeNotifier {
   void _startAudioHealthCheck() {
     _lastAudioReceived = DateTime.now();
     _audioHealthCheck?.cancel();
-    _audioHealthCheck = Timer.periodic(const Duration(seconds: 1), (timer) {
+    _audioHealthCheck = Timer.periodic(const Duration(seconds: 2), (timer) {
       final now = DateTime.now();
       final lastReceived = _lastAudioReceived;
 
       if (lastReceived != null &&
-          now.difference(lastReceived).inSeconds > 2 &&
+          now.difference(lastReceived).inSeconds > 5 &&
           _kwsState == KwsState.listening) {
-        debugPrint('[KWS] ⚠️ No audio received for 2s — attempting restart...');
+        debugPrint('[KWS] ⚠️ No audio received for 5s — attempting restart...');
         _restartKwsRecording();
       }
     });
@@ -285,8 +284,9 @@ class VadKwsTtsController extends ChangeNotifier {
       _audioSub = null;
       await _NativeAudio.stopRecording();
 
-      // Small delay
-      await Future.delayed(const Duration(milliseconds: 100));
+      // Give the Swift side time to complete stopRecording + activateSession
+      // before we call startRecording again.
+      await Future.delayed(const Duration(milliseconds: 400));
 
       // Re-subscribe then restart the hardware tap
       _audioSub = _NativeAudio.audioStream.listen(
@@ -420,9 +420,6 @@ class VadKwsTtsController extends ChangeNotifier {
         text: text,
         language: profile,
       );
-
-      // Stop any leftover playback from a previous TTS run
-      await _NativeAudio.stopPlayback();
 
       if (_ttsToken != thisToken) return;
 
